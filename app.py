@@ -1,19 +1,20 @@
 """
 Registro de propiedades fisicoquímicas de péptidos (Streamlit)
 ================================================================
-Aplicación para registrar, editar, guardar y exportar (Excel / PDF) un dataset
-de péptidos.
+Aplicación para registrar, editar, guardar y exportar (Excel / PDF / CSV) un
+dataset de péptidos, con acceso mediante RUT chileno (validación módulo 11).
 
 Ejecución local:
     streamlit run app.py
 
 Estructura de datos:
-    - Tabla de trabajo (temporal): vive en st.session_state, se pierde al cerrar
-      la pestaña o reiniciar la app.
-    - Dataset guardado (persistente): data/peptidos_guardados.csv
+    - Tabla de trabajo (temporal): vive en st.session_state de cada sesión.
+    - Dataset guardado (persistente), separado por usuario:
+          data/usuarios/<huella_del_RUT>/peptidos_guardados.csv
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from datetime import datetime
@@ -39,15 +40,15 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-st.set_page_config(page_title="Dataset de péptidos", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="Dataset de péptidos", layout="wide")
 
 # ---------------------------------------------------------------------------
 # 1. CONSTANTES Y DATOS DE REFERENCIA
 # ---------------------------------------------------------------------------
-DATA_DIR = Path("data")
-CSV_GUARDADO = DATA_DIR / "peptidos_guardados.csv"
+DATA_DIR = Path("data") / "usuarios"
 
 COL_ID = "Identificador"
+COL_OWNER = "RUT propietario"
 COLUMNS = [
     COL_ID,
     "Secuencia",
@@ -66,7 +67,12 @@ COLUMNS = [
     "Propiedades complementarias",
     "Notas",
     "Fecha de registro",
+    COL_OWNER,
 ]
+# Columnas que el usuario puede elegir incluir en un reporte (el RUT va en el encabezado)
+COLUMNS_EXPORTABLES = [c for c in COLUMNS if c not in (COL_ID, COL_OWNER)]
+# El RUT propietario se gestiona internamente: se oculta en las tablas
+CONFIG_OCULTA = {COL_OWNER: None}
 
 # Escala de hidropatía de Kyte-Doolittle (1982)
 KYTE_DOOLITTLE = {
@@ -112,6 +118,8 @@ OPCIONES_MENU = [
     "Importar registros desde CSV / Excel",
 ]
 
+TITULO_REPORTE_DEFECTO = "Dataset de propiedades fisicoquímicas de péptidos"
+
 # Valores por defecto de los widgets del formulario (también sirven para limpiarlo)
 DEFAULTS_FORM = {
     "f_id": "", "f_formato": FORMATO_1, "f_seq": "",
@@ -123,7 +131,51 @@ DEFAULTS_FORM = {
 
 
 # ---------------------------------------------------------------------------
-# 2. LÓGICA DE PROPIEDADES FISICOQUÍMICAS
+# 2. VALIDACIÓN DE RUT (MÓDULO 11)
+# ---------------------------------------------------------------------------
+def calcular_dv(cuerpo: str) -> str:
+    """Dígito verificador de un RUT por módulo 11.
+
+    Se recorren los dígitos del cuerpo de derecha a izquierda multiplicándolos
+    por la serie 2, 3, 4, 5, 6, 7, 2, 3... La suma se divide por 11 y el
+    dígito es 11 - resto (11 -> "0", 10 -> "K").
+    """
+    suma, factor = 0, 2
+    for digito in reversed(cuerpo):
+        suma += int(digito) * factor
+        factor = factor + 1 if factor < 7 else 2
+    resultado = 11 - (suma % 11)
+    if resultado == 11:
+        return "0"
+    if resultado == 10:
+        return "K"
+    return str(resultado)
+
+
+def validar_rut(raw: str) -> tuple[str | None, str | None]:
+    """Valida un RUT chileno. Devuelve (rut_normalizado, mensaje_de_error).
+
+    El RUT normalizado tiene el formato «12345678-5» (sin puntos).
+    """
+    limpio = re.sub(r"[.\-\s]", "", raw or "").upper()
+    if not limpio:
+        return None, "Ingresa tu RUT."
+    if not re.fullmatch(r"\d{7,8}[\dK]", limpio):
+        return None, "Formato de RUT no válido. Ejemplo: 12.345.678-5"
+    cuerpo, dv = limpio[:-1], limpio[-1]
+    if calcular_dv(cuerpo) != dv:
+        return None, "El dígito verificador no corresponde. Revisa el RUT ingresado."
+    return f"{cuerpo}-{dv}", None
+
+
+def formatear_rut(rut: str) -> str:
+    """12345678-5 -> 12.345.678-5"""
+    cuerpo, dv = rut.split("-")
+    return f"{int(cuerpo):,}".replace(",", ".") + f"-{dv}"
+
+
+# ---------------------------------------------------------------------------
+# 3. LÓGICA DE PROPIEDADES FISICOQUÍMICAS
 # ---------------------------------------------------------------------------
 def parse_sequence(raw: str, formato: str) -> tuple[str | None, str | None]:
     """Normaliza una secuencia a código de una letra.
@@ -183,14 +235,24 @@ def compute_properties(seq: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 3. PERSISTENCIA (CSV) Y UTILIDADES DE TABLA
+# 4. SESIÓN, PERSISTENCIA POR USUARIO Y UTILIDADES DE TABLA
 # ---------------------------------------------------------------------------
+def rut_actual() -> str:
+    return st.session_state["rut"]
+
+
 def init_state() -> None:
     if "registros" not in st.session_state:
         st.session_state.registros = pd.DataFrame(columns=COLUMNS)
     st.session_state.setdefault("editor_version", 0)
     for k, v in DEFAULTS_FORM.items():
         st.session_state.setdefault(k, v)
+
+
+def cerrar_sesion() -> None:
+    """Callback: elimina todo el estado de la sesión (tabla de trabajo incluida)."""
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
 
 
 def flash(tipo: str, mensaje: str) -> None:
@@ -210,30 +272,43 @@ def concat_seguro(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 def limpiar(df: pd.DataFrame) -> pd.DataFrame:
-    """Quita filas sin identificador y garantiza el orden de columnas."""
+    """Quita filas sin identificador, fija el orden de columnas y vincula al usuario."""
     df = df.copy()
     for c in COLUMNS:
         if c not in df.columns:
             df[c] = None
     df = df[COLUMNS]
     mask = df[COL_ID].notna() & (df[COL_ID].astype(str).str.strip() != "")
-    return df[mask].reset_index(drop=True)
+    df = df[mask].reset_index(drop=True)
+    df[COL_OWNER] = rut_actual()  # todo registro queda asociado al RUT de la sesión
+    return df
+
+
+def ruta_csv_usuario() -> Path:
+    """Ruta del CSV del usuario. La carpeta usa una huella (hash) del RUT, no el RUT."""
+    huella = hashlib.sha256(rut_actual().encode("utf-8")).hexdigest()[:24]
+    return DATA_DIR / huella / "peptidos_guardados.csv"
 
 
 def cargar_guardados() -> pd.DataFrame:
-    if not CSV_GUARDADO.exists():
+    ruta = ruta_csv_usuario()
+    if not ruta.exists():
         return pd.DataFrame(columns=COLUMNS)
-    df = pd.read_csv(CSV_GUARDADO, encoding="utf-8-sig")
+    df = pd.read_csv(ruta, encoding="utf-8-sig", dtype={COL_OWNER: str})
+    # Doble protección: solo se conservan filas cuyo propietario es el usuario actual
+    if COL_OWNER in df.columns:
+        df = df[df[COL_OWNER].astype(str) == rut_actual()]
     return limpiar(df)
 
 
 def guardar_csv(df: pd.DataFrame) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    df.to_csv(CSV_GUARDADO, index=False, encoding="utf-8-sig")
+    ruta = ruta_csv_usuario()
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(ruta, index=False, encoding="utf-8-sig")
 
 
 def fusionar_y_guardar(nuevos: pd.DataFrame, sobrescribir: bool) -> tuple[int, int, int]:
-    """Añade `nuevos` al CSV. Devuelve (agregados, actualizados, omitidos)."""
+    """Añade `nuevos` al CSV del usuario. Devuelve (agregados, actualizados, omitidos)."""
     existentes = cargar_guardados()
     ya_existen = nuevos[COL_ID].astype(str).isin(set(existentes[COL_ID].astype(str)))
     n_dup = int(ya_existen.sum())
@@ -248,19 +323,24 @@ def fusionar_y_guardar(nuevos: pd.DataFrame, sobrescribir: bool) -> tuple[int, i
 
 
 # ---------------------------------------------------------------------------
-# 4. EXPORTACIÓN A EXCEL Y PDF (con caché para no regenerar en cada rerun)
+# 5. GENERACIÓN DE REPORTES (EXCEL, PDF, CSV)
 # ---------------------------------------------------------------------------
+ESTADISTICAS_EXCEL = ["Longitud", "Masa molecular (Da)", "Hidrofobicidad (GRAVY)",
+                      "Carga neta aprox. (pH 7)", "% Apolares", "% Polares sin carga",
+                      "% Carga positiva", "% Carga negativa"]
+
+
 @st.cache_data(show_spinner=False)
-def build_excel(df: pd.DataFrame) -> bytes:
+def build_excel(df: pd.DataFrame, titulo: str, rut_fmt: str, incluir_resumen: bool) -> bytes:
     buffer = BytesIO()
+    azul = PatternFill("solid", fgColor="1F4E78")
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Peptidos")
         ws = writer.sheets["Peptidos"]
 
-        relleno = PatternFill("solid", fgColor="1F4E78")
         for celda in ws[1]:
             celda.font = Font(bold=True, color="FFFFFF")
-            celda.fill = relleno
+            celda.fill = azul
             celda.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
         for i, col in enumerate(df.columns, start=1):
@@ -273,11 +353,36 @@ def build_excel(df: pd.DataFrame) -> bytes:
 
         ws.freeze_panes = "B2"
         ws.auto_filter.ref = ws.dimensions
+
+        if incluir_resumen:
+            hoja = writer.book.create_sheet("Resumen")
+            hoja.append(["Título", titulo])
+            hoja.append(["RUT del usuario", rut_fmt])
+            hoja.append(["Fecha de generación", datetime.now().strftime("%Y-%m-%d %H:%M")])
+            hoja.append(["Total de registros", len(df)])
+            hoja.append([])
+            hoja.append(["Variable", "Promedio", "Mínimo", "Máximo"])
+            fila_cab = hoja.max_row
+            for col in ESTADISTICAS_EXCEL:
+                if col in df.columns:
+                    serie = pd.to_numeric(df[col], errors="coerce").dropna()
+                    if not serie.empty:
+                        hoja.append([col, round(float(serie.mean()), 3),
+                                     float(serie.min()), float(serie.max())])
+            for celda in hoja[fila_cab]:
+                celda.font = Font(bold=True, color="FFFFFF")
+                celda.fill = azul
+            for fila in range(1, 5):
+                hoja.cell(row=fila, column=1).font = Font(bold=True)
+            hoja.column_dimensions["A"].width = 30
+            for letra in "BCD":
+                hoja.column_dimensions[letra].width = 18
+            hoja.column_dimensions["B"].width = 45
     return buffer.getvalue()
 
 
 # Las fuentes estándar del PDF (Helvetica) solo cubren Latin-1; se sustituyen
-# símbolos comunes en notas estructurales (α-hélice, β-lámina, etc.).
+# símbolos comunes en notas estructurales (alfa-hélice, beta-lámina, etc.).
 _SUSTITUCIONES_PDF = {
     "α": "alfa", "β": "beta", "γ": "gamma", "δ": "delta", "κ": "kappa",
     "−": "-", "–": "-", "—": "-", "≥": ">=", "≤": "<=", "→": "->",
@@ -304,20 +409,34 @@ def _num(valor, formato: str) -> str:
 
 
 def _secuencia_en_bloques(seq, tam: int = 10) -> str:
-    if seq is None or (not isinstance(seq, str)) or not seq:
+    if not isinstance(seq, str) or not seq:
         return "-"
     bloques = " ".join(seq[i:i + tam] for i in range(0, len(seq), tam))
     return f'<font name="Courier">{escape(bloques)}</font>'
 
 
+# (encabezado, columna, formato, ancho relativo en cm) de la tabla resumen del PDF
+_RESUMEN_PDF = [
+    ("Identificador", COL_ID, None, 5.0),
+    ("Longitud", "Longitud", ".0f", 2.5),
+    ("Masa (Da)", "Masa molecular (Da)", ".2f", 3.0),
+    ("Polaridad", "Polaridad", None, 4.5),
+    ("GRAVY", "Hidrofobicidad (GRAVY)", ".3f", 2.5),
+    ("Carga neta", "Carga neta aprox. (pH 7)", ".0f", 2.5),
+    ("PDB / enlace", "Estructura 3D (PDB / enlace)", None, 5.2),
+]
+
+
 @st.cache_data(show_spinner=False)
-def build_pdf(df: pd.DataFrame) -> bytes:
+def build_pdf(df: pd.DataFrame, titulo: str, rut_fmt: str,
+              incluir_resumen: bool, incluir_fichas: bool) -> bytes:
     buffer = BytesIO()
     pagina = landscape(A4)
+    ancho_util = pagina[0] - 3 * cm
     doc = SimpleDocTemplate(
         buffer, pagesize=pagina, leftMargin=1.5 * cm, rightMargin=1.5 * cm,
         topMargin=1.5 * cm, bottomMargin=1.8 * cm,
-        title="Dataset de péptidos", author="App de registro de péptidos",
+        title=titulo, author=f"RUT {rut_fmt}",
     )
     estilos = getSampleStyleSheet()
     celda = ParagraphStyle("celda", parent=estilos["BodyText"], fontSize=8, leading=10)
@@ -325,60 +444,64 @@ def build_pdf(df: pd.DataFrame) -> bytes:
                               textColor=colors.white)
 
     historia = [
-        Paragraph("Dataset de propiedades fisicoquímicas de péptidos", estilos["Title"]),
-        Paragraph(f"Generado el {datetime.now():%Y-%m-%d %H:%M} &nbsp;|&nbsp; "
+        Paragraph(_pdf_txt(titulo), estilos["Title"]),
+        Paragraph(f"RUT del usuario: {escape(rut_fmt)} &nbsp;|&nbsp; "
+                  f"Generado el {datetime.now():%Y-%m-%d %H:%M} &nbsp;|&nbsp; "
                   f"Total de registros: {len(df)}", estilos["Normal"]),
         Spacer(1, 0.5 * cm),
-        Paragraph("Resumen", estilos["Heading2"]),
     ]
 
     # --- Tabla resumen -----------------------------------------------------
-    encabezados = ["Identificador", "Longitud", "Masa (Da)", "Polaridad",
-                   "GRAVY", "Carga neta", "PDB / enlace"]
-    filas = [[Paragraph(h, cabecera) for h in encabezados]]
-    for _, r in df.iterrows():
-        filas.append([
-            Paragraph(_pdf_txt(r[COL_ID]), celda),
-            Paragraph(_num(r["Longitud"], ".0f"), celda),
-            Paragraph(_num(r["Masa molecular (Da)"], ".2f"), celda),
-            Paragraph(_pdf_txt(r["Polaridad"]), celda),
-            Paragraph(_num(r["Hidrofobicidad (GRAVY)"], ".3f"), celda),
-            Paragraph(_num(r["Carga neta aprox. (pH 7)"], ".0f"), celda),
-            Paragraph(_pdf_txt(r["Estructura 3D (PDB / enlace)"]), celda),
-        ])
-    tabla = Table(filas, colWidths=[5 * cm, 3 * cm, 3 * cm, 4.5 * cm, 3 * cm, 3 * cm, 5.2 * cm],
-                  repeatRows=1)
-    tabla.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#EEF3F8")]),
-        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0B7BF")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    historia += [tabla, PageBreak(), Paragraph("Fichas detalladas", estilos["Heading2"])]
-
-    # --- Una ficha por péptido --------------------------------------------
-    campos = [c for c in COLUMNS if c != COL_ID]
-    for i, (_, r) in enumerate(df.iterrows(), start=1):
-        datos = []
-        for campo in campos:
-            valor = (_secuencia_en_bloques(r[campo]) if campo == "Secuencia"
-                     else _pdf_txt(r[campo]))
-            datos.append([Paragraph(f"<b>{escape(campo)}</b>", celda), Paragraph(valor, celda)])
-        ficha = Table(datos, colWidths=[6 * cm, 20.7 * cm])
-        ficha.setStyle(TableStyle([
-            ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#F5F7FA")]),
-            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#C9CED4")),
+    if incluir_resumen:
+        spec = [s for s in _RESUMEN_PDF if s[1] in df.columns]
+        factor = ancho_util / (sum(s[3] for s in spec) * cm)
+        anchos = [s[3] * cm * factor for s in spec]
+        filas = [[Paragraph(s[0], cabecera) for s in spec]]
+        for _, r in df.iterrows():
+            filas.append([
+                Paragraph(_pdf_txt(r[s[1]]) if s[2] is None else _num(r[s[1]], s[2]), celda)
+                for s in spec
+            ])
+        tabla = Table(filas, colWidths=anchos, repeatRows=1)
+        tabla.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#EEF3F8")]),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#B0B7BF")),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ]))
-        historia.append(KeepTogether([
-            Paragraph(f"{i}. {_pdf_txt(r[COL_ID])}", estilos["Heading3"]),
-            ficha,
-            Spacer(1, 0.4 * cm),
-        ]))
+        historia += [Paragraph("Resumen", estilos["Heading2"]), tabla]
+
+    # --- Una ficha por péptido --------------------------------------------
+    if incluir_fichas:
+        if incluir_resumen:
+            historia.append(PageBreak())
+        historia.append(Paragraph("Fichas detalladas", estilos["Heading2"]))
+        campos = [c for c in df.columns if c != COL_ID]
+        for i, (_, r) in enumerate(df.iterrows(), start=1):
+            datos = []
+            for campo in campos:
+                valor = (_secuencia_en_bloques(r[campo]) if campo == "Secuencia"
+                         else _pdf_txt(r[campo]))
+                datos.append([Paragraph(f"<b>{escape(campo)}</b>", celda), Paragraph(valor, celda)])
+            if not datos:  # solo se pidió el identificador
+                datos = [[Paragraph("<b>Identificador</b>", celda),
+                          Paragraph(_pdf_txt(r[COL_ID]), celda)]]
+            ficha = Table(datos, colWidths=[6 * cm, ancho_util - 6 * cm])
+            ficha.setStyle(TableStyle([
+                ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, colors.HexColor("#F5F7FA")]),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#C9CED4")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ]))
+            historia.append(KeepTogether([
+                Paragraph(f"{i}. {_pdf_txt(r[COL_ID])}", estilos["Heading3"]),
+                ficha,
+                Spacer(1, 0.4 * cm),
+            ]))
 
     def pie(canvas, documento):
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
+        canvas.drawString(1.5 * cm, 1 * cm, f"RUT {rut_fmt}")
         canvas.drawRightString(pagina[0] - 1.5 * cm, 1 * cm, f"Página {documento.page}")
         canvas.restoreState()
 
@@ -386,37 +509,85 @@ def build_pdf(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
-def bloque_exportacion(df: pd.DataFrame, prefijo: str, nombre_base: str) -> None:
-    """Botones de descarga de Excel, PDF y CSV."""
-    st.subheader("Exportar")
+def seccion_exportacion(df: pd.DataFrame, prefijo: str, nombre_base: str) -> None:
+    """Sección final de descarga: opciones del reporte y botones por formato."""
+    st.subheader("Exportación de reportes")
     if df.empty:
         st.info("No hay registros para exportar.")
         return
+
+    with st.expander("Opciones del reporte", expanded=True):
+        titulo = st.text_input("Título del reporte", value=TITULO_REPORTE_DEFECTO,
+                               key=f"{prefijo}_titulo").strip() or TITULO_REPORTE_DEFECTO
+        columnas = st.multiselect(
+            "Columnas a incluir (el identificador siempre se incluye)",
+            COLUMNS_EXPORTABLES, default=COLUMNS_EXPORTABLES, key=f"{prefijo}_columnas",
+        )
+        o1, o2, o3 = st.columns(3)
+        pdf_resumen = o1.checkbox("PDF: incluir tabla resumen", value=True, key=f"{prefijo}_pdf_res")
+        pdf_fichas = o2.checkbox("PDF: incluir fichas detalladas", value=True, key=f"{prefijo}_pdf_fic")
+        xls_resumen = o3.checkbox("Excel: incluir hoja de estadísticas", value=True,
+                                  key=f"{prefijo}_xls_res")
+
+    df_exp = df[[COL_ID] + columnas].reset_index(drop=True)
+    rut_fmt = formatear_rut(rut_actual())
     marca = datetime.now().strftime("%Y%m%d_%H%M")
+    st.caption(f"Se exportarán {len(df_exp)} registros y {len(df_exp.columns)} columnas.")
+
     c1, c2, c3 = st.columns(3)
-    c1.download_button(
-        "📊 Exportar a Excel (.xlsx)", data=build_excel(df),
-        file_name=f"{nombre_base}_{marca}.xlsx", key=f"{prefijo}_xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    c2.download_button(
-        "📄 Exportar a PDF", data=build_pdf(df),
-        file_name=f"{nombre_base}_{marca}.pdf", key=f"{prefijo}_pdf",
-        mime="application/pdf",
-    )
-    c3.download_button(
-        "🧾 Exportar a CSV", data=df.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"{nombre_base}_{marca}.csv", key=f"{prefijo}_csv", mime="text/csv",
-    )
+    with c1:
+        st.markdown("**Excel (.xlsx)**")
+        st.caption("Hoja de datos con formato y filtros, más hoja opcional de estadísticas.")
+        st.download_button(
+            "Descargar Excel", data=build_excel(df_exp, titulo, rut_fmt, xls_resumen),
+            file_name=f"{nombre_base}_{marca}.xlsx", key=f"{prefijo}_xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with c2:
+        st.markdown("**PDF**")
+        st.caption("Informe estructurado con tabla resumen y una ficha por péptido.")
+        if pdf_resumen or pdf_fichas:
+            st.download_button(
+                "Descargar PDF",
+                data=build_pdf(df_exp, titulo, rut_fmt, pdf_resumen, pdf_fichas),
+                file_name=f"{nombre_base}_{marca}.pdf", key=f"{prefijo}_pdf",
+                mime="application/pdf",
+            )
+        else:
+            st.warning("Selecciona la tabla resumen y/o las fichas para generar el PDF.")
+    with c3:
+        st.markdown("**CSV (.csv)**")
+        st.caption("Datos planos, compatibles con R, Python y otras herramientas.")
+        st.download_button(
+            "Descargar CSV", data=df_exp.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{nombre_base}_{marca}.csv", key=f"{prefijo}_csv", mime="text/csv",
+        )
 
 
 # ---------------------------------------------------------------------------
-# 5. PÁGINAS DE LA APLICACIÓN
+# 6. PÁGINAS DE LA APLICACIÓN
 # ---------------------------------------------------------------------------
+def pantalla_login() -> None:
+    st.title("Dataset de propiedades fisicoquímicas de péptidos")
+    st.subheader("Acceso")
+    st.write("Ingresa tu RUT para continuar. Tus registros quedarán vinculados a él "
+             "y solo tú podrás verlos y gestionarlos.")
+    with st.form("form_login"):
+        rut_in = st.text_input("RUT", placeholder="12.345.678-5")
+        enviado = st.form_submit_button("Ingresar", type="primary")
+    if enviado:
+        rut, error = validar_rut(rut_in)
+        if error:
+            st.error(error)
+        else:
+            st.session_state["rut"] = rut
+            st.rerun()
+
+
 def pantalla_bienvenida() -> None:
     st.markdown(
         "Registra péptidos con sus propiedades fisicoquímicas, acumúlalos en una tabla "
-        "editable y expórtalos a **Excel** o **PDF**.\n\n"
+        "editable y expórtalos a **Excel**, **PDF** o **CSV**.\n\n"
         "Elige una opción en el menú de arriba para comenzar."
     )
     c1, c2 = st.columns(2)
@@ -463,6 +634,7 @@ def agregar_registro() -> None:
         "Propiedades complementarias": s.f_props.strip(),
         "Notas": s.f_notas.strip(),
         "Fecha de registro": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        COL_OWNER: rut_actual(),
     }
     s.registros = concat_seguro([s.registros, pd.DataFrame([fila])])
     flash("success", f"Registro «{ident}» agregado a la tabla de trabajo.")
@@ -531,7 +703,7 @@ def pagina_crear() -> None:
     st.text_input("ID o enlace a archivo PDB (opcional)", key="f_pdb",
                   placeholder="Ej. 2MAG o https://www.rcsb.org/structure/2MAG")
     st.text_area("Descripción / notas estructurales (opcional)", key="f_estruc", height=80,
-                 placeholder="Ej. α-hélice anfipática en medio lipídico; método RMN...")
+                 placeholder="Ej. alfa-hélice anfipática en medio lipídico; método RMN...")
 
     # --- Campos adicionales -----------------------------------------------
     st.subheader("4. Información complementaria")
@@ -539,12 +711,13 @@ def pagina_crear() -> None:
                  placeholder="Ej. punto isoeléctrico, solubilidad, actividad biológica...")
     st.text_area("Notas (opcional)", key="f_notas", height=80)
 
-    st.button("➕ Agregar registro a la tabla de trabajo", type="primary", on_click=agregar_registro)
+    st.button("Agregar registro a la tabla de trabajo", type="primary", on_click=agregar_registro)
 
     if not s.registros.empty:
         st.divider()
         st.caption(f"Últimos registros en la tabla de trabajo ({len(s.registros)} en total)")
-        st.dataframe(s.registros.tail(5), width="stretch", hide_index=True)
+        st.dataframe(s.registros.tail(5), width="stretch", hide_index=True,
+                     column_config=CONFIG_OCULTA)
 
 
 def pagina_gestionar() -> None:
@@ -559,14 +732,14 @@ def pagina_gestionar() -> None:
                "Recuerda pulsar «Aplicar cambios» para conservar lo editado.")
     editado = st.data_editor(
         s.registros, num_rows="dynamic", width="stretch", hide_index=True,
-        key=f"editor_{s.editor_version}",
+        key=f"editor_{s.editor_version}", column_config=CONFIG_OCULTA,
     )
     editado = limpiar(editado)
     if editado[COL_ID].duplicated().any():
         st.warning("Hay identificadores duplicados en la tabla.")
 
     c1, c2 = st.columns(2)
-    if c1.button("✅ Aplicar cambios a la tabla"):
+    if c1.button("Aplicar cambios a la tabla"):
         s.registros = editado
         s.editor_version += 1  # reinicia el editor para evitar ediciones "fantasma"
         flash("success", "Cambios aplicados.")
@@ -574,7 +747,7 @@ def pagina_gestionar() -> None:
 
     with c2:
         sobrescribir = st.checkbox("Sobrescribir registros con el mismo identificador al guardar")
-        if st.button("💾 Guardar definitivamente en el dataset (CSV)"):
+        if st.button("Guardar definitivamente en el dataset (CSV)"):
             s.registros = editado
             nuevos, actualizados, omitidos = fusionar_y_guardar(editado, sobrescribir)
             s.editor_version += 1
@@ -584,13 +757,13 @@ def pagina_gestionar() -> None:
 
     with st.expander("Vaciar tabla de trabajo"):
         if st.checkbox("Confirmo que quiero eliminar todos los registros de la tabla de trabajo"):
-            if st.button("🗑️ Vaciar tabla"):
+            if st.button("Vaciar tabla"):
                 s.registros = pd.DataFrame(columns=COLUMNS)
                 s.editor_version += 1
                 st.rerun()
 
     st.divider()
-    bloque_exportacion(editado, "trabajo", "peptidos_tabla_trabajo")
+    seccion_exportacion(editado, "trabajo", "peptidos_tabla_trabajo")
 
 
 def pagina_guardados() -> None:
@@ -604,15 +777,15 @@ def pagina_guardados() -> None:
     filtro = st.text_input("Buscar", placeholder="Identificador, secuencia, notas...")
     vista = guardados
     if filtro:
-        mascara = guardados.astype(str).apply(
+        mascara = guardados.drop(columns=COL_OWNER).astype(str).apply(
             lambda col: col.str.contains(filtro, case=False, na=False, regex=False)
         ).any(axis=1)
         vista = guardados[mascara]
     st.caption(f"Mostrando {len(vista)} de {len(guardados)} registros")
-    st.dataframe(vista, width="stretch", hide_index=True)
+    st.dataframe(vista, width="stretch", hide_index=True, column_config=CONFIG_OCULTA)
 
     c1, c2 = st.columns(2)
-    if c1.button("⬆️ Cargar registros mostrados en la tabla de trabajo"):
+    if c1.button("Cargar registros mostrados en la tabla de trabajo"):
         actuales = set(st.session_state.registros[COL_ID].astype(str))
         nuevos = vista[~vista[COL_ID].astype(str).isin(actuales)]
         st.session_state.registros = concat_seguro([st.session_state.registros, nuevos])
@@ -623,21 +796,21 @@ def pagina_guardados() -> None:
     with c2.expander("Eliminar registros del dataset guardado"):
         ids = st.multiselect("Identificadores a eliminar", guardados[COL_ID].astype(str).tolist())
         confirmar = st.checkbox("Confirmo la eliminación permanente")
-        if st.button("🗑️ Eliminar seleccionados") and ids and confirmar:
+        if st.button("Eliminar seleccionados") and ids and confirmar:
             guardar_csv(guardados[~guardados[COL_ID].astype(str).isin(ids)])
             flash("success", f"{len(ids)} registros eliminados.")
             st.rerun()
 
     st.divider()
     st.caption("Se exporta lo que se muestra en la tabla (aplica el filtro de búsqueda).")
-    bloque_exportacion(vista, "guardados", "peptidos_dataset")
+    seccion_exportacion(vista, "guardados", "peptidos_dataset")
 
 
 def pagina_importar() -> None:
     st.header("Importar registros")
     st.caption(f"El archivo debe contener al menos la columna «{COL_ID}». "
-               "Las columnas ausentes se dejarán vacías. Lo ideal es importar un archivo "
-               "exportado previamente por esta app.")
+               "Las columnas ausentes se dejarán vacías. Los registros importados quedarán "
+               "vinculados a tu RUT. Lo ideal es importar un archivo exportado por esta aplicación.")
     archivo = st.file_uploader("Archivo CSV o Excel", type=["csv", "xlsx"])
     if archivo is None:
         return
@@ -652,7 +825,7 @@ def pagina_importar() -> None:
         return
 
     df = limpiar(df)
-    st.dataframe(df, width="stretch", hide_index=True)
+    st.dataframe(df, width="stretch", hide_index=True, column_config=CONFIG_OCULTA)
     if st.button("Agregar a la tabla de trabajo", type="primary"):
         actuales = set(st.session_state.registros[COL_ID].astype(str))
         nuevos = df[~df[COL_ID].astype(str).isin(actuales)]
@@ -663,19 +836,26 @@ def pagina_importar() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. PUNTO DE ENTRADA
+# 7. PUNTO DE ENTRADA
 # ---------------------------------------------------------------------------
 def main() -> None:
+    # Puerta de acceso: sin RUT válido no se muestra nada más
+    if "rut" not in st.session_state:
+        pantalla_login()
+        return
+
     init_state()
-    st.title("🧬 Dataset de propiedades fisicoquímicas de péptidos")
+    st.title("Dataset de propiedades fisicoquímicas de péptidos")
+
+    with st.sidebar:
+        st.subheader("Sesión")
+        st.write(f"RUT: {formatear_rut(rut_actual())}")
+        st.metric("Tabla de trabajo", len(st.session_state.registros))
+        st.caption("La tabla de trabajo es temporal: guárdala en el dataset para conservarla.")
+        st.button("Cerrar sesión", on_click=cerrar_sesion)
 
     opcion = st.selectbox("¿Qué deseas realizar?", OPCIONES_MENU, index=None,
                           placeholder="Selecciona una opción…", key="menu")
-
-    with st.sidebar:
-        st.subheader("Estado")
-        st.metric("Tabla de trabajo", len(st.session_state.registros))
-        st.caption("La tabla de trabajo es temporal: guárdala en el dataset para conservarla.")
 
     st.divider()
     if opcion is None:

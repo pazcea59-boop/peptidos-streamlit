@@ -15,5 +15,5 @@ __pycache__/
 .vscode/
 .idea/
 
-# Dataset local: descomenta la siguiente línea si NO quieres subir tus datos a GitHub
-# data/
+# Datos de usuarios (vinculados a RUT): NO subir a GitHub
+data/
