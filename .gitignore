@@ -1,0 +1,19 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+
+# Streamlit (secretos locales)
+.streamlit/secrets.toml
+
+# Sistema / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Dataset local: descomenta la siguiente línea si NO quieres subir tus datos a GitHub
+# data/
